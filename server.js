@@ -10,7 +10,16 @@ const FILES_DIR = path.join(__dirname, 'files');
 const PORT = process.env.PORT || 3000;
 
 const GB = 1024 ** 3;
-const SIZES = { '1GB': 1 * GB, '5GB': 5 * GB };
+const MIN_GB = 1;
+const MAX_GB = 100;
+
+/** Parses "7", "7GB" or "7gb" into a whole number of GB in range, or returns null. */
+function parseSizeGB(param) {
+  const match = /^(\d+)(gb)?$/i.exec(param);
+  if (!match) return null;
+  const gb = Number(match[1]);
+  return gb >= MIN_GB && gb <= MAX_GB ? gb : null;
+}
 const LINE = 'This is a sample line of text used to fill a large test file.\n';
 // Write ~16 MB at a time; a whole number of lines so no line is split between chunks.
 const CHUNK_SIZE = Math.floor((16 * 1024 * 1024) / LINE.length) * LINE.length;
@@ -49,14 +58,25 @@ async function generateFile(filePath, size) {
 }
 
 /** Returns the path to a ready file of the given size, creating it if needed. */
-async function ensureFile(label) {
-  const size = SIZES[label];
+async function ensureFile(gb) {
+  const label = `${gb}GB`;
+  const size = gb * GB;
   const filePath = path.join(FILES_DIR, `bigfile-${label}.txt`);
 
   const stat = await fsp.stat(filePath).catch(() => null);
   if (stat && stat.size === size) return filePath;
 
   if (!pending.has(label)) {
+    // Refuse up front rather than fill the disk partway and fail.
+    const { bavail, bsize } = await fsp.statfs(FILES_DIR);
+    const free = bavail * bsize;
+    if (free < size) {
+      const err = new Error(
+        `Not enough disk space for ${label}: ${(free / GB).toFixed(1)} GB free. Delete generated files with DELETE /api/files.`
+      );
+      err.status = 507;
+      throw err;
+    }
     console.log(`Generating ${label} file...`);
     const started = Date.now();
     const job = generateFile(filePath, size)
@@ -73,20 +93,23 @@ const app = express();
 app.get('/', (_req, res) => {
   res.json({
     endpoints: {
-      'GET /api/download/:size': `Download a generated file. size = ${Object.keys(SIZES).join(' | ')}`,
+      'GET /api/download/:size': `Download a generated file of that many GB. size = ${MIN_GB}-${MAX_GB} (e.g. 7 or 7GB)`,
       'DELETE /api/files': 'Delete generated files to free disk space',
     },
   });
 });
 
 app.get('/api/download/:size', async (req, res, next) => {
-  const label = req.params.size.toUpperCase();
-  if (!SIZES[label]) {
-    return res.status(400).json({ error: `Invalid size. Use one of: ${Object.keys(SIZES).join(', ')}` });
+  const gb = parseSizeGB(req.params.size);
+  if (gb === null) {
+    return res
+      .status(400)
+      .json({ error: `Invalid size. Use a whole number of GB from ${MIN_GB} to ${MAX_GB}, e.g. 7 or 7GB.` });
   }
+  const label = `${gb}GB`;
 
   try {
-    const filePath = await ensureFile(label);
+    const filePath = await ensureFile(gb);
     // res.download streams the file (no full buffering), sets
     // Content-Disposition/Content-Length, and supports Range requests
     // so interrupted downloads can be resumed.
@@ -111,7 +134,7 @@ app.delete('/api/files', async (_req, res, next) => {
 
 app.use((err, _req, res, _next) => {
   console.error(err);
-  res.status(500).json({ error: err.message });
+  res.status(err.status || 500).json({ error: err.message });
 });
 
 await fsp.mkdir(FILES_DIR, { recursive: true });
